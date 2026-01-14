@@ -41,6 +41,7 @@ const ResponsiveChatApp: React.FC = () => {
   const [loadingUsers, setLoadingUsers] = useState(false)
   const [loadingMessages, setLoadingMessages] = useState(false)
   const [sendingMessage, setSendingMessage] = useState(false)
+  const sendingMessageRef = useRef(false)
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set())
   const [chatSearchTerm, setChatSearchTerm] = useState("")
   const [activeTab, setActiveTab] = useState<"chats" | "todos">("chats")
@@ -49,9 +50,43 @@ const ResponsiveChatApp: React.FC = () => {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [todoSidebarCollapsed, setTodoSidebarCollapsed] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const messagesContainerRef = useRef<HTMLDivElement>(null)
+  const desktopMessagesRef = useRef<HTMLDivElement>(null)
+  const mobileMessagesRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const typingTimeoutRef = useRef<NodeJS.Timeout>(null)
+  const lastMessageCountRef = useRef(0)
+  const selectedUserRef = useRef<ChatUser | null>(null)
+  const currentUserRef = useRef<ChatUser | null>(null)
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    selectedUserRef.current = selectedUser
+  }, [selectedUser])
+
+  useEffect(() => {
+    currentUserRef.current = currentUser
+  }, [currentUser])
+
+  // Centralized scroll function (retries across a short window to survive Suspense/lazy rendering)
+  const scrollToBottom = useCallback(() => {
+    const start = performance.now()
+
+    const attempt = () => {
+      if (desktopMessagesRef.current) {
+        desktopMessagesRef.current.scrollTop = desktopMessagesRef.current.scrollHeight
+      }
+      if (mobileMessagesRef.current) {
+        mobileMessagesRef.current.scrollTop = mobileMessagesRef.current.scrollHeight
+      }
+
+      // Keep trying for ~800ms to catch lazy-loaded MessageBubble renders.
+      if (performance.now() - start < 800) {
+        requestAnimationFrame(attempt)
+      }
+    }
+
+    requestAnimationFrame(attempt)
+  }, [])
 
   const getInitials = useCallback((user: ChatUser) => {
     if (user.full_name) {
@@ -249,71 +284,97 @@ useEffect(() => {
   const channelName = [currentUser.id, selectedUser.id].sort().join(':')
   console.log('📡 Subscribing to channel:', `messages:${channelName}`)
 
-  const channel = supabase
-    .channel(`messages:${channelName}`)
-    .on(
-      "postgres_changes",
-      {
-        event: "INSERT",
-        schema: "public",
-        table: "messages",
-      },
-      (payload) => {
-        const newMessage = payload.new as Message
-        
-        // Only process messages between current user and selected user
-        const isRelevant = 
-          (newMessage.sender_id === currentUser.id && newMessage.receiver_id === selectedUser.id) ||
-          (newMessage.sender_id === selectedUser.id && newMessage.receiver_id === currentUser.id)
-        
-        if (!isRelevant) {
-          console.log('⏭️ Irrelevant message, skipping')
-          return
-        }
-        
-        console.log('📨 Real-time message received:', newMessage)
-        
-        setMessages((prev) => {
-          // Prevent duplicates by checking if message already exists
-          const existingIndex = prev.findIndex(msg => msg.id === newMessage.id)
-          if (existingIndex !== -1) {
-            console.log('⚠️ Duplicate message, skipping')
-            return prev
-          }
+  let reconnectAttempts = 0
+  const maxReconnectAttempts = 5
 
-          // Check for optimistic message to replace
-          const optimisticIndex = prev.findIndex(msg => 
-            msg.is_optimistic && 
-            msg.content === newMessage.content && 
-            msg.sender_id === newMessage.sender_id &&
-            Math.abs(new Date(msg.created_at).getTime() - new Date(newMessage.created_at).getTime()) < 10000
-          )
+  const setupChannel = () => {
+    const channel = supabase
+      .channel(`messages:${channelName}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+        },
+        (payload) => {
+          const newMessage = payload.new as Message
           
-          if (optimisticIndex !== -1) {
-            console.log('✅ Replacing optimistic message with real one')
-            const updatedMessages = [...prev]
-            updatedMessages[optimisticIndex] = { ...newMessage, is_optimistic: false }
-            return updatedMessages
+          // Only process messages between current user and selected user
+          const isRelevant = 
+            (newMessage.sender_id === currentUser.id && newMessage.receiver_id === selectedUser.id) ||
+            (newMessage.sender_id === selectedUser.id && newMessage.receiver_id === currentUser.id)
+          
+          if (!isRelevant) {
+            console.log('⏭️ Irrelevant message, skipping')
+            return
           }
           
-          console.log('➕ Adding new message to list')
-          // Add new message in correct chronological order
-          const newMessages = [...prev, newMessage]
-          return newMessages.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-        })
+          console.log('📨 Real-time message received:', newMessage)
+          
+          setMessages((prev) => {
+            // Prevent duplicates by checking if message already exists
+            const existingIndex = prev.findIndex(msg => msg.id === newMessage.id)
+            if (existingIndex !== -1) {
+              console.log('⚠️ Duplicate message, skipping')
+              return prev
+            }
 
-        // Mark as read if it's from the selected user
-        if (newMessage.sender_id === selectedUser.id) {
-          markMessagesAsRead(newMessage.sender_id)
+            // Check for optimistic message to replace
+            const optimisticIndex = prev.findIndex(msg => 
+              msg.is_optimistic && 
+              msg.content === newMessage.content && 
+              msg.sender_id === newMessage.sender_id &&
+              Math.abs(new Date(msg.created_at).getTime() - new Date(newMessage.created_at).getTime()) < 10000
+            )
+            
+            if (optimisticIndex !== -1) {
+              console.log('✅ Replacing optimistic message with real one')
+              const updatedMessages = [...prev]
+              updatedMessages[optimisticIndex] = { ...newMessage, is_optimistic: false }
+              return updatedMessages
+            }
+            
+            console.log('➕ Adding new message to list')
+            // Add new message in correct chronological order
+            const newMessages = [...prev, newMessage]
+            return newMessages.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+          })
+
+          // Mark as read if it's from the selected user
+          if (newMessage.sender_id === selectedUser.id) {
+            markMessagesAsRead(newMessage.sender_id)
+          }
         }
-      }
-    )
-    .subscribe((status) => {
-      console.log('📡 Subscription status:', status)
-    })
+      )
+      .subscribe((status) => {
+        console.log('📡 Subscription status:', status)
+        
+        if (status === 'CLOSED' && reconnectAttempts < maxReconnectAttempts) {
+          reconnectAttempts++
+          console.log(`🔄 Connection closed, attempting reconnect ${reconnectAttempts}/${maxReconnectAttempts}`)
+          setTimeout(() => {
+            supabase.removeChannel(channel)
+            setupChannel()
+          }, 2000 * reconnectAttempts)
+        } else if (status === 'CHANNEL_ERROR') {
+          console.error('❌ Channel error - connection may be unstable')
+        }
+      })
+
+    return channel
+  }
+
+  const channel = setupChannel()
+
+  // Heartbeat to keep connection alive
+  const heartbeat = setInterval(() => {
+    console.log('💓 Heartbeat: checking connection...')
+  }, 30000) // Every 30 seconds
 
   return () => {
     console.log('🔌 Unsubscribing from messages channel')
+    clearInterval(heartbeat)
     supabase.removeChannel(channel)
   }
 }, [currentUser, selectedUser, markMessagesAsRead])
@@ -345,18 +406,29 @@ useEffect(() => {
   useEffect(() => {
     if (selectedUser && currentUser) {
       setMessages([])
-      loadMessages(selectedUser.id)
+      lastMessageCountRef.current = 0
+      ;(async () => {
+        await loadMessages(selectedUser.id)
+        // After initial load, force a reliable bottom scroll.
+        scrollToBottom()
+      })()
       markMessagesAsRead(selectedUser.id)
       setShowMobileChat(true)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedUser?.id, currentUser?.id])
 
+  // Scroll to bottom when message count increases (new message sent or received)
   useEffect(() => {
-    if (messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: "smooth" })
+    if (messages.length > lastMessageCountRef.current && messages.length > 0) {
+      scrollToBottom()
+      lastMessageCountRef.current = messages.length
+    } else if (messages.length > 0 && lastMessageCountRef.current === 0) {
+      // Initial load safety net.
+      scrollToBottom()
+      lastMessageCountRef.current = messages.length
     }
-  }, [filteredMessages])
+  }, [messages.length, scrollToBottom])
 
   const handleTyping = useCallback(async () => {
     if (!selectedUser || !currentUser) return
@@ -384,18 +456,25 @@ useEffect(() => {
   }, [selectedUser, currentUser, isTyping])
 
 const sendMessage = useCallback(async () => {
+  // Use refs to get fresh values, avoid stale closure
+  const currentUserVal = currentUserRef.current
+  const selectedUserVal = selectedUserRef.current
   const messageContent = newMessage.trim()
-  if (!messageContent || !selectedUser || !currentUser || sendingMessage) return
+  
+  if (!messageContent || !selectedUserVal || !currentUserVal || sendingMessageRef.current) {
+    return
+  }
 
   setSendingMessage(true)
+  sendingMessageRef.current = true
   const tempId = `temp_${Date.now()}_${Math.random()}`
   const now = new Date().toISOString()
 
   // Optimistic UI update
   const optimisticMessage: Message = {
     id: tempId,
-    sender_id: currentUser.id,
-    receiver_id: selectedUser.id,
+    sender_id: currentUserVal.id,
+    receiver_id: selectedUserVal.id,
     content: messageContent,
     created_at: now,
     is_read: false,
@@ -407,16 +486,25 @@ const sendMessage = useCallback(async () => {
   setNewMessage("")
 
   try {
-    const { data, error } = await supabase
+    // Refresh session before sending to prevent timeout
+    const { data: { session }, error: sessionError } = await supabase.auth.getSession()
+    if (sessionError || !session) {
+      throw new Error('Session expired. Please refresh the page.')
+    }
+    console.log('✅ Session verified')
+
+    const insertPromise = supabase
       .from("messages")
       .insert({
-        sender_id: currentUser.id,
-        receiver_id: selectedUser.id,
+        sender_id: currentUserVal.id,
+        receiver_id: selectedUserVal.id,
         content: messageContent,
         is_read: false,
       })
       .select("id, sender_id, receiver_id, content, created_at, is_read, is_system, is_task_created")
       .single()
+
+    const { data, error } = await insertPromise as any
 
     if (error) throw error
 
@@ -435,17 +523,28 @@ const sendMessage = useCallback(async () => {
       })
     }, 3000)
     
-  } catch (error) {
+  } catch (error: any) {
     console.error("❌ Failed to send message:", error)
+    
+    let errorMessage = 'Failed to send message'
+    if (error?.name === 'AbortError') {
+      errorMessage = 'Network timeout. Please try again.'
+    } else if (error?.message?.includes('Session expired')) {
+      errorMessage = 'Request failed. Please refresh and try again.'
+    }
+    
     // Mark optimistic message as failed
     setMessages((prev) =>
       prev.map((msg) => (msg.id === tempId ? { ...msg, failed: true, is_optimistic: false } : msg))
     )
     setNewMessage(messageContent)
+    alert(errorMessage)
   } finally {
+    // Always reset sending state
     setSendingMessage(false)
+    sendingMessageRef.current = false
   }
-}, [newMessage, selectedUser, currentUser, sendingMessage])
+}, [newMessage])
 
   const retryMessage = useCallback(
     async (failedMessage: Message) => {
@@ -765,7 +864,7 @@ const sendMessage = useCallback(async () => {
               {/* Messages Container */}
               <div className="flex-1 min-h-0 overflow-hidden">
                 <div
-                  ref={messagesContainerRef}
+                  ref={desktopMessagesRef}
                   className="h-full overflow-y-auto p-6 space-y-6 bg-gradient-to-b from-muted/10 to-background"
                 >
                   {loadingMessages && messages.length === 0 ? (
@@ -958,7 +1057,7 @@ const sendMessage = useCallback(async () => {
           <div className="w-full bg-card flex flex-col h-full">
             {/* Mobile Messages */}
             <div className="flex-1 min-h-0 overflow-hidden">
-              <div ref={messagesContainerRef} className="h-full overflow-y-auto p-4 space-y-4">
+              <div ref={mobileMessagesRef} className="h-full overflow-y-auto p-4 space-y-4">
                 {loadingMessages && messages.length === 0 ? (
                   <div className="text-center py-8">
                     <div className="w-8 h-8 border-2 border-muted border-t-primary rounded-full animate-spin mx-auto mb-3"></div>
