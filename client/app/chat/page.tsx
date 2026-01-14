@@ -5,6 +5,7 @@ import { supabase } from "@/utils/supabase"
 import { Search, LogOut, X, MessageSquare, Users, CheckSquare, Send, ArrowLeft, MoreVertical, Settings, Phone, Video, Info } from 'lucide-react'
 import useDebounce from "@/hooks/useDebounce"
 import { ThemeToggle } from "@/components/theme-toggle"
+import { useToast } from "@/components/toast"
 // Lazy load components
 const TodoList = lazy(() => import("@/components/TodoList"))
 const MessageBubble = lazy(() => import("@/components/MessageBubble"))
@@ -31,6 +32,7 @@ interface Message {
 }
 
 const ResponsiveChatApp: React.FC = () => {
+  const { toast } = useToast()
   const [currentUser, setCurrentUser] = useState<ChatUser | null>(null)
   const [users, setUsers] = useState<ChatUser[]>([])
   const [selectedUser, setSelectedUser] = useState<ChatUser | null>(null)
@@ -181,7 +183,12 @@ const ResponsiveChatApp: React.FC = () => {
           setUsers(profiles || [])
         }
       } catch (error) {
-        console.error("Initialization error:", error)
+        console.error("[chat:init] Initialization error", error)
+        toast({
+          title: "Chat init failed",
+          description: error instanceof Error ? error.message : "Unexpected error",
+          variant: "destructive",
+        })
       } finally {
         setLoading(false)
       }
@@ -191,33 +198,55 @@ const ResponsiveChatApp: React.FC = () => {
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (event === "SIGNED_IN" && session?.user) {
-        const user = session.user
-        const userData = {
-          id: user.id,
-          username: user.user_metadata?.username || user.email?.split("@")[0] || "user",
-          full_name: user.user_metadata?.full_name,
-          avatar_url: user.user_metadata?.avatar_url,
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      // Supabase docs: avoid `async` callbacks / awaiting or calling other Supabase
+      // methods inside this callback, as it runs synchronously and can deadlock.
+      // Defer any Supabase calls to the next tick.
+      setTimeout(async () => {
+        try {
+          if (event === "SIGNED_IN" && session?.user) {
+            const user = session.user
+
+            // SIGNED_IN can fire frequently (e.g. on refocus). Avoid reloading everything
+            // if we're already signed in as the same user.
+            if (currentUserRef.current?.id === user.id) return
+
+            const userData = {
+              id: user.id,
+              username: user.user_metadata?.username || user.email?.split("@")[0] || "user",
+              full_name: user.user_metadata?.full_name,
+              avatar_url: user.user_metadata?.avatar_url,
+            }
+
+            console.log("[chat:auth] SIGNED_IN", { userId: user.id })
+            setCurrentUser(userData)
+
+            // Load other users
+            const { data: profiles, error: profilesError } = await supabase
+              .from("profiles")
+              .select("*")
+              .neq("id", user.id)
+              .order("full_name", { ascending: true })
+              .limit(50)
+
+            if (profilesError) throw profilesError
+            setUsers(profiles || [])
+          } else if (event === "SIGNED_OUT") {
+            console.log("[chat:auth] SIGNED_OUT")
+            setCurrentUser(null)
+            setUsers([])
+            setSelectedUser(null)
+            setMessages([])
+          }
+        } catch (error) {
+          console.error("[chat:auth] onAuthStateChange handler failed", error)
+          toast({
+            title: "Auth update failed",
+            description: error instanceof Error ? error.message : "Unexpected error",
+            variant: "destructive",
+          })
         }
-
-        setCurrentUser(userData)
-
-        // Load other users
-        const { data: profiles } = await supabase
-          .from("profiles")
-          .select("*")
-          .neq("id", user.id)
-          .order("full_name", { ascending: true })
-          .limit(50)
-        
-        setUsers(profiles || [])
-      } else if (event === "SIGNED_OUT") {
-        setCurrentUser(null)
-        setUsers([])
-        setSelectedUser(null)
-        setMessages([])
-      }
+      }, 0)
     })
 
     return () => {
@@ -245,13 +274,18 @@ const ResponsiveChatApp: React.FC = () => {
         if (error) throw error
         setMessages(data || [])
       } catch (error) {
-        console.error("Failed to load messages:", error)
+        console.error("[chat:loadMessages] failed", error)
+        toast({
+          title: "Failed to load messages",
+          description: error instanceof Error ? error.message : "Unexpected error",
+          variant: "destructive",
+        })
         setMessages([])
       } finally {
         setLoadingMessages(false)
       }
     },
-    [currentUser],
+    [currentUser, toast],
   )
 
   const markMessagesAsRead = useCallback(
@@ -348,17 +382,32 @@ useEffect(() => {
         }
       )
       .subscribe((status) => {
-        console.log('📡 Subscription status:', status)
+        console.log('[chat:realtime] status', status)
         
         if (status === 'CLOSED' && reconnectAttempts < maxReconnectAttempts) {
           reconnectAttempts++
-          console.log(`🔄 Connection closed, attempting reconnect ${reconnectAttempts}/${maxReconnectAttempts}`)
+          console.warn('[chat:realtime] CLOSED; reconnecting', {
+            attempt: reconnectAttempts,
+            max: maxReconnectAttempts,
+          })
           setTimeout(() => {
             supabase.removeChannel(channel)
             setupChannel()
           }, 2000 * reconnectAttempts)
+        } else if (status === 'CLOSED') {
+          console.error('[chat:realtime] CLOSED; giving up')
+          toast({
+            title: "Realtime disconnected",
+            description: "Live updates stopped. Refresh the page to reconnect.",
+            variant: "destructive",
+          })
         } else if (status === 'CHANNEL_ERROR') {
-          console.error('❌ Channel error - connection may be unstable')
+          console.error('[chat:realtime] CHANNEL_ERROR')
+          toast({
+            title: "Realtime error",
+            description: "Connection may be unstable. Messages might not update live.",
+            variant: "destructive",
+          })
         }
       })
 
@@ -377,7 +426,7 @@ useEffect(() => {
     clearInterval(heartbeat)
     supabase.removeChannel(channel)
   }
-}, [currentUser, selectedUser, markMessagesAsRead])
+}, [currentUser, selectedUser, markMessagesAsRead, toast])
 
   useEffect(() => {
     if (!currentUser || !selectedUser) return
@@ -481,17 +530,22 @@ const sendMessage = useCallback(async () => {
     is_optimistic: true,
   }
 
-  console.log('📤 Sending message:', messageContent)
+  console.log('[chat:send] sending', {
+    from: currentUserVal.id,
+    to: selectedUserVal.id,
+    len: messageContent.length,
+    tempId,
+  })
   setMessages((prev) => [...prev, optimisticMessage])
   setNewMessage("")
 
   try {
-    // Refresh session before sending to prevent timeout
+    // Refresh session before sending to prevent auth edge cases.
     const { data: { session }, error: sessionError } = await supabase.auth.getSession()
     if (sessionError || !session) {
       throw new Error('Session expired. Please refresh the page.')
     }
-    console.log('✅ Session verified')
+    console.log('[chat:send] session ok', { userId: session.user.id })
 
     const insertPromise = supabase
       .from("messages")
@@ -508,7 +562,7 @@ const sendMessage = useCallback(async () => {
 
     if (error) throw error
 
-    console.log('✅ Message inserted successfully:', data.id)
+    console.log('[chat:send] inserted', { id: data?.id })
     
     // The real-time subscription will replace the optimistic message
     // But if real-time fails, manually add it after a timeout
@@ -516,7 +570,7 @@ const sendMessage = useCallback(async () => {
       setMessages((prev) => {
         const stillOptimistic = prev.find(msg => msg.id === tempId && msg.is_optimistic)
         if (stillOptimistic && data) {
-          console.log('⚠️ Real-time didn\'t deliver, manually replacing optimistic message')
+          console.warn('[chat:send] realtime did not deliver; replacing optimistic', { tempId, id: data.id })
           return prev.map(msg => msg.id === tempId ? { ...data, is_optimistic: false } : msg)
         }
         return prev
@@ -524,7 +578,7 @@ const sendMessage = useCallback(async () => {
     }, 3000)
     
   } catch (error: any) {
-    console.error("❌ Failed to send message:", error)
+    console.error("[chat:send] failed", error)
     
     let errorMessage = 'Failed to send message'
     if (error?.name === 'AbortError') {
@@ -538,13 +592,18 @@ const sendMessage = useCallback(async () => {
       prev.map((msg) => (msg.id === tempId ? { ...msg, failed: true, is_optimistic: false } : msg))
     )
     setNewMessage(messageContent)
-    alert(errorMessage)
+
+    toast({
+      title: "Message failed to send",
+      description: errorMessage,
+      variant: "destructive",
+    })
   } finally {
     // Always reset sending state
     setSendingMessage(false)
     sendingMessageRef.current = false
   }
-}, [newMessage])
+}, [newMessage, toast])
 
   const retryMessage = useCallback(
     async (failedMessage: Message) => {
@@ -567,9 +626,14 @@ const sendMessage = useCallback(async () => {
       await supabase.auth.signOut()
       window.location.href = "/"
     } catch (error) {
-      console.error("Error signing out:", error)
+      console.error("[chat:auth] signOut failed", error)
+      toast({
+        title: "Sign out failed",
+        description: error instanceof Error ? error.message : "Unexpected error",
+        variant: "destructive",
+      })
     }
-  }, [])
+  }, [toast])
 
   const clearChatSearch = useCallback(() => {
     setChatSearchTerm("")
