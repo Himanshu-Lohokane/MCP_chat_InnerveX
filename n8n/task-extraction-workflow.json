@@ -1,0 +1,241 @@
+{
+  "name": "AI Task Extraction Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "new-message",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "New Message Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.body.content }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are an intelligent task extraction assistant. Analyze chat messages to detect tasks, todos, or calendar events.\n\nExtract the following:\n1. **has_task**: true if message contains a task/todo\n2. **task_content**: The task description\n3. **priority**: low | medium | high | urgent\n4. **confidence**: 0.0-1.0 (only extract if > 0.7)\n5. **reasoning**: Why you identified this as a task\n6. **has_calendar_event**: true if message mentions a date/time\n7. **due_date**: YYYY-MM-DD format (if mentioned)\n8. **start_time**: ISO 8601 format (if specific time mentioned)\n9. **end_time**: ISO 8601 format (default 1 hour after start)\n\nExamples:\n- \"We need to finish the presentation by Friday\" → has_task: true, priority: high, due_date: <next Friday>\n- \"Let's meet at 2pm tomorrow\" → has_task: true, has_calendar_event: true, start_time: <tomorrow 2pm>\n- \"Great work!\" → has_task: false\n\nRespond ONLY with JSON."
+        }
+      },
+      "id": "ai-agent",
+      "name": "AI Task Analyzer",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.5,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "model": "gemini-2.0-flash-exp",
+        "options": {
+          "temperature": 0.3,
+          "maxOutputTokens": 500
+        }
+      },
+      "id": "gemini-model",
+      "name": "Google Gemini 2.0",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [460, 500],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "YOUR_GOOGLE_API_CREDENTIAL_ID",
+          "name": "Google Gemini API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.has_task }}",
+              "value2": true
+            },
+            {
+              "value1": "={{ $json.confidence >= 0.7 }}",
+              "value2": true
+            }
+          ]
+        },
+        "combineOperation": "all"
+      },
+      "id": "check-confidence",
+      "name": "Check Confidence > 0.7",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "tasks",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldName": "content",
+              "fieldValue": "={{ $json.task_content }}"
+            },
+            {
+              "fieldName": "priority",
+              "fieldValue": "={{ $json.priority }}"
+            },
+            {
+              "fieldName": "confidence",
+              "fieldValue": "={{ $json.confidence }}"
+            },
+            {
+              "fieldName": "reasoning",
+              "fieldValue": "={{ $json.reasoning }}"
+            },
+            {
+              "fieldName": "sender_id",
+              "fieldValue": "={{ $('New Message Webhook').item.json.body.sender_id }}"
+            },
+            {
+              "fieldName": "receiver_id",
+              "fieldValue": "={{ $('New Message Webhook').item.json.body.receiver_id }}"
+            },
+            {
+              "fieldName": "message_id",
+              "fieldValue": "={{ $('New Message Webhook').item.json.body.id }}"
+            },
+            {
+              "fieldName": "status",
+              "fieldValue": "pending"
+            },
+            {
+              "fieldName": "due_date",
+              "fieldValue": "={{ $json.due_date }}"
+            }
+          ]
+        }
+      },
+      "id": "create-task-supabase",
+      "name": "Create Task in Supabase",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [900, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "messages",
+        "filterType": "manual",
+        "matchBy": "id",
+        "matchValue": "={{ $('New Message Webhook').item.json.body.id }}",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldName": "is_task_created",
+              "fieldValue": "true"
+            }
+          ]
+        }
+      },
+      "id": "mark-message-processed",
+      "name": "Mark Message as Processed",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1120, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.has_calendar_event }}",
+              "value2": true
+            },
+            {
+              "value1": "={{ $json.start_time && $json.start_time !== '' }}",
+              "value2": true
+            }
+          ]
+        },
+        "combineOperation": "all"
+      },
+      "id": "check-calendar",
+      "name": "Has Calendar Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "mode": "list",
+          "value": "primary"
+        },
+        "title": "={{ $json.task_content }}",
+        "start": "={{ $json.start_time }}",
+        "end": "={{ $json.end_time }}",
+        "additionalFields": {
+          "description": "=Automatically created from chat message\n\nConfidence: {{ $json.confidence * 100 }}%\nReasoning: {{ $json.reasoning }}"
+        }
+      },
+      "id": "create-calendar-event",
+      "name": "Create Google Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [1120, 400],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "YOUR_GOOGLE_CALENDAR_CREDENTIAL_ID",
+          "name": "Google Calendar OAuth"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "New Message Webhook": {
+      "main": [[{ "node": "AI Task Analyzer", "type": "main", "index": 0 }]]
+    },
+    "AI Task Analyzer": {
+      "main": [[{ "node": "Check Confidence > 0.7", "type": "main", "index": 0 }]]
+    },
+    "Google Gemini 2.0": {
+      "ai_languageModel": [[{ "node": "AI Task Analyzer", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "Check Confidence > 0.7": {
+      "main": [
+        [
+          { "node": "Create Task in Supabase", "type": "main", "index": 0 },
+          { "node": "Has Calendar Event?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Create Task in Supabase": {
+      "main": [[{ "node": "Mark Message as Processed", "type": "main", "index": 0 }]]
+    },
+    "Has Calendar Event?": {
+      "main": [[{ "node": "Create Google Calendar Event", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2026-01-13T00:00:00.000Z",
+  "versionId": "1"
+}
