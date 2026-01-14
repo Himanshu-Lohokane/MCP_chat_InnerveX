@@ -6,6 +6,7 @@ import { Search, LogOut, X, MessageSquare, Users, CheckSquare, Send, ArrowLeft, 
 import useDebounce from "@/hooks/useDebounce"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { useToast } from "@/components/toast"
+import { triggerN8nAgent, createSessionId } from "@/utils/n8n"
 // Lazy load components
 const TodoList = lazy(() => import("@/components/TodoList"))
 const MessageBubble = lazy(() => import("@/components/MessageBubble"))
@@ -320,6 +321,7 @@ useEffect(() => {
 
   let reconnectAttempts = 0
   const maxReconnectAttempts = 5
+  let isEffectActive = true
 
   const setupChannel = () => {
     const channel = supabase
@@ -382,7 +384,14 @@ useEffect(() => {
         }
       )
       .subscribe((status) => {
+        if (!isEffectActive) return
+
         console.log('[chat:realtime] status', status)
+
+        if (status === 'SUBSCRIBED') {
+          reconnectAttempts = 0
+          return
+        }
         
         if (status === 'CLOSED' && reconnectAttempts < maxReconnectAttempts) {
           reconnectAttempts++
@@ -391,16 +400,22 @@ useEffect(() => {
             max: maxReconnectAttempts,
           })
           setTimeout(() => {
+            if (!isEffectActive) return
             supabase.removeChannel(channel)
             setupChannel()
           }, 2000 * reconnectAttempts)
         } else if (status === 'CLOSED') {
-          console.error('[chat:realtime] CLOSED; giving up')
-          toast({
-            title: "Realtime disconnected",
-            description: "Live updates stopped. Refresh the page to reconnect.",
-            variant: "destructive",
-          })
+          // This can happen after network sleep / tab lifecycle / server hiccups.
+          // Use warn (not error) to avoid Next.js dev overlay.
+          console.warn('[chat:realtime] CLOSED; giving up')
+          // Only toast if the user is actively on this tab.
+          if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+            toast({
+              title: "Realtime disconnected",
+              description: "Live updates stopped. Refresh the page to reconnect.",
+              variant: "destructive",
+            })
+          }
         } else if (status === 'CHANNEL_ERROR') {
           console.error('[chat:realtime] CHANNEL_ERROR')
           toast({
@@ -423,6 +438,7 @@ useEffect(() => {
 
   return () => {
     console.log('🔌 Unsubscribing from messages channel')
+    isEffectActive = false
     clearInterval(heartbeat)
     supabase.removeChannel(channel)
   }
@@ -563,6 +579,30 @@ const sendMessage = useCallback(async () => {
     if (error) throw error
 
     console.log('[chat:send] inserted', { id: data?.id })
+
+    // Send to n8n AI agent (non-blocking - runs in background)
+    triggerN8nAgent({
+      chatInput: messageContent,
+      sessionId: createSessionId(currentUserVal.id, selectedUserVal.id),
+      senderId: currentUserVal.id,
+      receiverId: selectedUserVal.id,
+      messageId: data.id,
+      timestamp: data.created_at,
+    }).then(async (n8nResponse) => {
+      // When n8n responds (could be seconds later), insert system message
+      if (n8nResponse?.output) {
+        console.log('[chat:send] inserting system message from n8n')
+        await supabase.from('messages').insert({
+          sender_id: currentUserVal.id,
+          receiver_id: selectedUserVal.id,
+          content: n8nResponse.output,
+          is_system: true,
+          is_read: true,
+        })
+      }
+    }).catch((err) => {
+      console.warn('[chat:send] n8n background task failed', err)
+    })
     
     // The real-time subscription will replace the optimistic message
     // But if real-time fails, manually add it after a timeout
